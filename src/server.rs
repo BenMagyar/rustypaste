@@ -3,7 +3,7 @@ use crate::config::{Config, LandingPageConfig, TokenType};
 use crate::file::Directory;
 use crate::header::{self, ContentDisposition};
 use crate::mime as mime_util;
-use crate::paste::{Paste, PasteType};
+use crate::paste::{Paste, PasteType, PASTE_VARIANTS_LIST};
 use crate::util::{self, safe_path_join};
 use actix_files::NamedFile;
 use actix_multipart::Multipart;
@@ -450,7 +450,9 @@ pub struct ListItem {
     /// Uploaded file name.
     pub file_name: PathBuf,
     /// Size of the file in bytes.
-    pub file_size: u64,
+    pub file_size: Option<u64>,
+    /// Item type
+    pub item_type: PasteType,
     /// ISO8601 formatted date-time of the moment the file was created (uploaded).
     pub creation_date_utc: Option<String>,
     /// ISO8601 formatted date-time string of the expiration timestamp if one exists for this file.
@@ -469,59 +471,82 @@ async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> 
         warn!("server is not configured to expose list endpoint");
         Err(error::ErrorNotFound(""))?;
     }
-    let entries: Vec<ListItem> = fs::read_dir(config.server.upload_path)?
-        .filter_map(|entry| {
-            entry.ok().and_then(|e| {
-                let metadata = match e.metadata() {
-                    Ok(metadata) => {
-                        if metadata.is_dir() {
+
+    let get_item_list = |item_type: PasteType| -> Result<Vec<ListItem>, Error> {
+        let dir = item_type.get_path(&config.server.upload_path)?;
+
+        //FIX: When running some tests (e.g. test_list) other folders than "root" does not exists
+        if !fs::exists(&dir).unwrap_or(false) {
+            return Ok(Vec::default());
+        }
+        Ok(fs::read_dir(dir.as_path())?
+            .filter_map(|entry| {
+                entry.ok().and_then(|e| {
+                    let metadata = match e.metadata() {
+                        Ok(metadata) => {
+                            if metadata.is_dir() {
+                                return None;
+                            }
+                            metadata
+                        }
+                        Err(e) => {
+                            error!("failed to read metadata: {e}");
                             return None;
                         }
-                        metadata
-                    }
-                    Err(e) => {
-                        error!("failed to read metadata: {e}");
-                        return None;
-                    }
-                };
-                let mut file_name = PathBuf::from(e.file_name());
+                    };
+                    let mut file_name = PathBuf::from(e.file_name());
 
-                let creation_date_utc = metadata.created().ok().map(|v| {
-                    let millis = v
-                        .duration_since(UNIX_EPOCH)
-                        .expect("Time since UNIX epoch should be valid.")
-                        .as_millis();
-                    uts2ts::uts2ts(
-                        i64::try_from(millis).expect("UNIX time should be smaller than i64::MAX")
-                            / 1000,
-                    )
-                    .as_string()
-                });
+                    let creation_date_utc = metadata.created().ok().map(|v| {
+                        let millis = v
+                            .duration_since(UNIX_EPOCH)
+                            .expect("Time since UNIX epoch should be valid.")
+                            .as_millis();
+                        uts2ts::uts2ts(
+                            i64::try_from(millis)
+                                .expect("UNIX time should be smaller than i64::MAX")
+                                / 1000,
+                        )
+                        .as_string()
+                    });
 
-                let expires_at_utc = if let Some(expiration) = file_name
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .and_then(|v| v.parse::<i64>().ok())
-                {
-                    file_name.set_extension("");
-                    if util::get_system_time().ok()?
-                        > Duration::from_millis(expiration.try_into().ok()?)
+                    let expires_at_utc = if let Some(expiration) = file_name
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .and_then(|v| v.parse::<i64>().ok())
                     {
-                        return None;
-                    }
-                    Some(uts2ts::uts2ts(expiration / 1000).as_string())
-                } else {
-                    None
-                };
-                Some(ListItem {
-                    file_name,
-                    file_size: metadata.len(),
-                    creation_date_utc,
-                    expires_at_utc,
+                        file_name.set_extension("");
+                        if util::get_system_time().ok()?
+                            > Duration::from_millis(expiration.try_into().ok()?)
+                        {
+                            return None;
+                        }
+                        Some(uts2ts::uts2ts(expiration / 1000).as_string())
+                    } else {
+                        None
+                    };
+                    Some(ListItem {
+                        file_name,
+                        file_size: match item_type {
+                            PasteType::File | PasteType::Oneshot => Some(metadata.len()),
+                            _ => None,
+                        },
+                        item_type,
+                        creation_date_utc,
+                        expires_at_utc,
+                    })
                 })
             })
-        })
+            .collect())
+    };
+
+    let entries: Vec<ListItem> = PASTE_VARIANTS_LIST
+        .iter()
+        .map(|variant| get_item_list(*variant))
+        .collect::<Result<Vec<Vec<ListItem>>, Error>>()?
+        .into_iter()
+        .flatten()
         .collect();
+
     Ok(HttpResponse::Ok().json(entries))
 }
 
@@ -847,6 +872,92 @@ mod tests {
             result.first().expect("json object").file_name,
             PathBuf::from(filename)
         );
+
+        fs::remove_dir_all(test_upload_dir)?;
+
+        Ok(())
+    }
+
+    #[actix_web::test]
+    async fn test_list_item_type() -> Result<(), Error> {
+        let mut config = Config::default();
+        config.server.expose_list = Some(true);
+
+        let test_upload_dir = "test_upload";
+        config.server.upload_path = PathBuf::from(test_upload_dir);
+
+        for variant in PASTE_VARIANTS_LIST {
+            fs::create_dir_all(
+                variant
+                    .get_path(&config.server.upload_path)
+                    .expect("Bad upload path"),
+            )?;
+        }
+
+        let app = test::init_service(
+            App::new()
+                .app_data(Data::new(RwLock::new(config)))
+                .app_data(Data::new(Client::default()))
+                .configure(configure_routes),
+        )
+        .await;
+
+        let filename = "test_file.txt";
+        let timestamp = util::get_system_time()?.as_secs().to_string();
+        test::call_service(
+            &app,
+            get_multipart_request(&timestamp, "file", filename).to_request(),
+        )
+        .await;
+        let filename_oneshot = "oneshot.txt";
+        test::call_service(
+            &app,
+            get_multipart_request(&timestamp, "oneshot", filename_oneshot).to_request(),
+        )
+        .await;
+        test::call_service(
+            &app,
+            get_multipart_request(env!("CARGO_PKG_HOMEPAGE"), "url", "").to_request(),
+        )
+        .await;
+        let filename_oneshot_url = "oneshot_url";
+        test::call_service(
+            &app,
+            get_multipart_request(
+                env!("CARGO_PKG_HOMEPAGE"),
+                filename_oneshot_url,
+                filename_oneshot_url,
+            )
+            .to_request(),
+        )
+        .await;
+
+        let request = TestRequest::default()
+            .insert_header(("content-type", "text/plain"))
+            .uri("/list")
+            .to_request();
+        let result: Vec<ListItem> = test::call_and_read_body_json(&app, request).await;
+
+        assert_eq!(result.len(), 4);
+
+        // Items returned from `/list` endpoint should be returned in this order:
+        // 1. PasteType::File
+        // 2. PasteType::Oneshot
+        // 3. PasteType::Url
+        // 4. PasteType::OneshotUrl
+        // NOTE: The test won't pass if order in `PASTE_VARIANTS_LIST` changes
+
+        assert_eq!(result[0].file_name, PathBuf::from(filename));
+        assert_eq!(result[0].item_type, PasteType::File);
+
+        assert_eq!(result[1].file_name, PathBuf::from(filename_oneshot));
+        assert_eq!(result[1].item_type, PasteType::Oneshot);
+
+        assert_eq!(result[2].file_name, PathBuf::from("url"));
+        assert_eq!(result[2].item_type, PasteType::Url);
+
+        assert_eq!(result[3].file_name, PathBuf::from(filename_oneshot_url));
+        assert_eq!(result[3].item_type, PasteType::OneshotUrl);
 
         fs::remove_dir_all(test_upload_dir)?;
 

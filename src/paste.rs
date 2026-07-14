@@ -4,6 +4,7 @@ use crate::header::ContentDisposition;
 use crate::util;
 use actix_web::{error, web, Error};
 use awc::Client;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Error as IoError, Result as IoResult, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,8 @@ use std::{
 use url::Url;
 
 /// Type of the data to store.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PasteType {
     /// Any type of file.
     File,
@@ -31,6 +33,16 @@ pub enum PasteType {
     /// A password-protected file.
     ProtectedFile,
 }
+
+/// Slice of all paste variants that may be returned by `/list` endpoint
+/// NOTE: PasteType::RemoteFile is missing, because it cannot be distinguished
+///       between itself and PasteType::File without storing additional information
+pub const PASTE_VARIANTS_LIST: [PasteType; 4] = [
+    PasteType::File,
+    PasteType::Oneshot,
+    PasteType::Url,
+    PasteType::OneshotUrl,
+];
 
 impl<'a> TryFrom<&'a ContentDisposition> for PasteType {
     type Error = ();
@@ -575,7 +587,9 @@ mod tests {
         fs::remove_file(file_path)?;
 
         config.server.max_content_length = Byte::from_str("30k").expect("cannot parse byte");
-        let url = String::from("https://raw.githubusercontent.com/orhun/rustypaste/refs/heads/master/img/rp_test_3b5eeeee7a7326cd6141f54820e6356a0e9d1dd4021407cb1d5e9de9f034ed2f.png");
+        let url = String::from(
+            "https://raw.githubusercontent.com/orhun/rustypaste/refs/heads/master/img/rp_test_3b5eeeee7a7326cd6141f54820e6356a0e9d1dd4021407cb1d5e9de9f034ed2f.png",
+        );
         let mut paste = Paste {
             data: url.as_bytes().to_vec(),
             type_: PasteType::RemoteFile,
@@ -599,7 +613,9 @@ mod tests {
         fs::remove_file(file_path)?;
 
         config.server.max_content_length = Byte::from_str("30k").expect("cannot parse byte");
-        let url = String::from("https://raw.githubusercontent.com/orhun/rustypaste/refs/heads/master/img/rp_test_3b5eeeee7a7326cd6141f54820e6356a0e9d1dd4021407cb1d5e9de9f034ed2f.png");
+        let url = String::from(
+            "https://raw.githubusercontent.com/orhun/rustypaste/refs/heads/master/img/rp_test_3b5eeeee7a7326cd6141f54820e6356a0e9d1dd4021407cb1d5e9de9f034ed2f.png",
+        );
         let mut paste = Paste {
             data: url.as_bytes().to_vec(),
             type_: PasteType::RemoteFile,
