@@ -5,7 +5,7 @@ use crate::util;
 use actix_web::{error, web, Error};
 use awc::Client;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::{Error as IoError, Result as IoResult, Write};
 use std::path::{Path, PathBuf};
 use std::str;
@@ -112,6 +112,8 @@ pub struct Paste {
 pub struct UploadResult {
     /// The filename of the uploaded file.
     pub filename: String,
+    /// Exact path written on disk, including an expiry suffix when present.
+    pub storage_path: PathBuf,
     /// The password for protected files, if applicable.
     ///
     /// This is `Some` only for `PasteType::ProtectedFile`.
@@ -230,18 +232,38 @@ impl Paste {
         // Generate and store password BEFORE creating content (prevents unprotected window)
         let password = if self.type_.is_protected() {
             let pwd = crate::password::generate_password();
-            crate::password::store_password_hash(&path, &pwd)
-                .map_err(|e| error::ErrorInternalServerError(format!("password storage: {e}")))?;
+            if let Err(storage_error) = crate::password::store_password_hash(&path, &pwd) {
+                if storage_error.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Err(error::ErrorConflict("file already exists\n"));
+                }
+                return Err(error::ErrorInternalServerError(format!(
+                    "password storage: {storage_error}"
+                )));
+            }
             Some(pwd)
         } else {
             None
         };
 
-        let mut buffer = File::create(&path)?;
-        buffer.write_all(&self.data)?;
+        let mut buffer = match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(buffer) => buffer,
+            Err(open_error) => {
+                crate::password::delete_password_file(&path).ok();
+                if open_error.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Err(error::ErrorConflict("file already exists\n"));
+                }
+                return Err(open_error.into());
+            }
+        };
+        if let Err(write_error) = buffer.write_all(&self.data) {
+            fs::remove_file(&path).ok();
+            crate::password::delete_password_file(&path).ok();
+            return Err(write_error.into());
+        }
 
         Ok(UploadResult {
             filename: file_name,
+            storage_path: path,
             password,
         })
     }
@@ -300,7 +322,10 @@ impl Paste {
             .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
         let bytes_checksum = util::sha256_digest(&*bytes)?;
         self.data = bytes;
-        if !config.paste.duplicate_files.unwrap_or(true) && expiry_date.is_none() {
+        if config.auth.is_none()
+            && !config.paste.duplicate_files.unwrap_or(true)
+            && expiry_date.is_none()
+        {
             if let Some(file) =
                 Directory::try_from(config.server.upload_path.as_path())?.get_file(bytes_checksum)
             {
@@ -311,6 +336,7 @@ impl Paste {
                         .map(|v| v.to_string_lossy())
                         .unwrap_or_default()
                         .to_string(),
+                    storage_path: file.path,
                     password: None,
                 });
             }
@@ -347,9 +373,17 @@ impl Paste {
         if let Some(timestamp) = expiry_date {
             path.set_file_name(format!("{file_name}.{timestamp}"));
         }
-        fs::write(&path, url.to_string())?;
+        let mut buffer = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        if let Err(write_error) = buffer.write_all(url.to_string().as_bytes()) {
+            fs::remove_file(&path).ok();
+            return Err(write_error);
+        }
         Ok(UploadResult {
             filename: file_name,
+            storage_path: path,
             password: None,
         })
     }
@@ -653,5 +687,40 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn url_store_never_overwrites_an_existing_path() {
+        let directory = tempfile::tempdir().expect("create upload directory");
+        let mut config = Config::default();
+        config.server.upload_path = directory.path().to_path_buf();
+        fs::create_dir_all(
+            PasteType::Url
+                .get_path(&config.server.upload_path)
+                .expect("URL upload path"),
+        )
+        .expect("create URL directory");
+
+        let first = Paste {
+            data: b"https://first.example/path".to_vec(),
+            type_: PasteType::Url,
+        };
+        let result = first
+            .store_url(None, Some(String::from("shared")), &config)
+            .expect("store first URL");
+
+        let replacement = Paste {
+            data: b"https://replacement.example/path".to_vec(),
+            type_: PasteType::Url,
+        };
+        let error = replacement
+            .store_url(None, Some(String::from("shared")), &config)
+            .expect_err("reject replacement URL");
+
+        assert_eq!(std::io::ErrorKind::AlreadyExists, error.kind());
+        assert_eq!(
+            "https://first.example/path",
+            fs::read_to_string(result.storage_path).expect("read original URL")
+        );
     }
 }

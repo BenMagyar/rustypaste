@@ -1,16 +1,14 @@
-use crate::auth::{extract_tokens, handle_unauthorized_error, unauthorized_error};
-use crate::config::{Config, LandingPageConfig, TokenType};
+use crate::auth::{AuthRuntime, CredentialSource, RequestAuth, SessionCookieRefresh};
+use crate::config::{Config, LandingPageConfig};
 use crate::file::Directory;
 use crate::header::{self, ContentDisposition};
 use crate::mime as mime_util;
 use crate::paste::{Paste, PasteType, PASTE_VARIANTS_LIST};
+use crate::store::{NewPaste, PasteInsert, PasteRecord, StoreError};
 use crate::util::{self, safe_path_join};
 use actix_files::NamedFile;
 use actix_multipart::Multipart;
-use actix_web::http::StatusCode;
-use actix_web::middleware::ErrorHandlers;
 use actix_web::{delete, error, get, post, route, web, Error, HttpRequest, HttpResponse};
-use actix_web_grants::GrantsMiddleware;
 use awc::error::HeaderValue;
 use awc::http::header::{CONTENT_SECURITY_POLICY, X_CONTENT_TYPE_OPTIONS};
 use awc::Client;
@@ -44,10 +42,36 @@ fn extract_password_from_auth(auth_header: &str) -> Option<String> {
     }
 }
 
+fn extract_protected_password(request: &HttpRequest, auth: &RequestAuth) -> Option<String> {
+    if let Some(password) = request
+        .headers()
+        .get("X-Rustypaste-Password")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(password.to_string());
+    }
+    if matches!(
+        auth.source,
+        CredentialSource::Browser { .. } | CredentialSource::LegacyPublic
+    ) {
+        request
+            .headers()
+            .get(actix_web::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(extract_password_from_auth)
+    } else {
+        None
+    }
+}
+
 /// Shows the landing page.
 #[get("/")]
 #[allow(deprecated)]
-async fn index(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> {
+async fn index(
+    _auth: RequestAuth,
+    config: web::Data<RwLock<Config>>,
+) -> Result<HttpResponse, Error> {
     let mut config = config
         .read()
         .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?
@@ -101,6 +125,7 @@ struct ServeOptions {
 /// Serves a file from the upload directory.
 #[route("/{file}", method = "GET", method = "HEAD")]
 async fn serve(
+    auth: RequestAuth,
     request: HttpRequest,
     file: web::Path<String>,
     options: Option<web::Query<ServeOptions>>,
@@ -108,40 +133,57 @@ async fn serve(
 ) -> Result<HttpResponse, Error> {
     let config = config
         .read()
-        .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
-    let mut path = util::glob_match_file(safe_path_join(&config.server.upload_path, &*file)?)?;
-    let mut paste_type = PasteType::File;
-    if !path.exists() || path.is_dir() {
-        for type_ in &[
-            PasteType::Url,
-            PasteType::Oneshot,
-            PasteType::OneshotUrl,
-            PasteType::ProtectedFile,
-        ] {
-            let alt_path = safe_path_join(type_.get_path(&config.server.upload_path)?, &*file)?;
-            let alt_path = util::glob_match_file(alt_path)?;
-            if alt_path.exists()
-                || path.file_name().and_then(|v| v.to_str()) == Some(&type_.get_dir())
-            {
-                path = alt_path;
-                paste_type = *type_;
-                break;
+        .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?
+        .clone();
+    let (path, paste_type) = if let Some(runtime) = request.app_data::<web::Data<AuthRuntime>>() {
+        let records = runtime
+            .store
+            .find_pastes_by_public_filename(&file)
+            .await
+            .map_err(error::ErrorInternalServerError)?;
+        let record = records
+            .into_iter()
+            .find(|record| record.storage_path.is_file())
+            .ok_or_else(|| error::ErrorNotFound("file is not found or expired :(\n"))?;
+        if !record
+            .storage_path
+            .starts_with(path_clean::PathClean::clean(&config.server.upload_path))
+        {
+            return Err(error::ErrorInternalServerError(
+                "paste metadata points outside the upload directory",
+            ));
+        }
+        (record.storage_path, record.paste_type)
+    } else {
+        let mut path = util::glob_match_file(safe_path_join(&config.server.upload_path, &*file)?)?;
+        let mut paste_type = PasteType::File;
+        if !path.exists() || path.is_dir() {
+            for type_ in &[
+                PasteType::Url,
+                PasteType::Oneshot,
+                PasteType::OneshotUrl,
+                PasteType::ProtectedFile,
+            ] {
+                let alt_path = safe_path_join(type_.get_path(&config.server.upload_path)?, &*file)?;
+                let alt_path = util::glob_match_file(alt_path)?;
+                if alt_path.exists()
+                    || path.file_name().and_then(|v| v.to_str()) == Some(&type_.get_dir())
+                {
+                    path = alt_path;
+                    paste_type = *type_;
+                    break;
+                }
             }
         }
-    }
+        (path, paste_type)
+    };
     if !path.is_file() || !path.exists() {
         return Err(error::ErrorNotFound("file is not found or expired :(\n"));
     }
 
     // Check password protection
     if crate::password::has_password(&path) {
-        use actix_web::http::header::AUTHORIZATION;
-
-        let password = request
-            .headers()
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(extract_password_from_auth)
+        let password = extract_protected_password(&request, &auth)
             .ok_or_else(|| error::ErrorNotFound("file is not found or expired :(\n"))?;
 
         if !crate::password::verify_file_password(&path, &password)
@@ -175,14 +217,13 @@ async fn serve(
                 apply_security_headers(&mut response);
             }
             if paste_type.is_oneshot() {
-                fs::rename(
-                    &path,
-                    path.with_file_name(format!(
-                        "{}.{}",
-                        file,
-                        util::get_system_time()?.as_millis()
-                    )),
-                )?;
+                let consumed_path = path.with_file_name(format!(
+                    "{}.{}",
+                    file,
+                    util::get_system_time()?.as_millis()
+                ));
+                fs::rename(&path, consumed_path)?;
+                delete_metadata_for_path(&request, &path).await?;
             }
             Ok(response)
         }
@@ -197,9 +238,24 @@ async fn serve(
                 &path,
                 path.with_file_name(format!("{}.{}", file, util::get_system_time()?.as_millis())),
             )?;
+            delete_metadata_for_path(&request, &path).await?;
             Ok(resp)
         }
     }
+}
+
+async fn delete_metadata_for_path(
+    request: &HttpRequest,
+    path: &std::path::Path,
+) -> Result<(), Error> {
+    if let Some(runtime) = request.app_data::<web::Data<AuthRuntime>>() {
+        runtime
+            .store
+            .delete_paste_by_storage_path(path)
+            .await
+            .map_err(error::ErrorInternalServerError)?;
+    }
+    Ok(())
 }
 
 /// Adds security hardening headers to the response.
@@ -251,14 +307,51 @@ fn is_text_like_mime(mime_type: &mime::Mime, overrides: &[String]) -> bool {
 
 /// Remove a file from the upload directory.
 #[delete("/{file}")]
-#[actix_web_grants::protect("TokenType::Delete", ty = TokenType, error = unauthorized_error)]
 async fn delete(
+    auth: RequestAuth,
+    request: HttpRequest,
     file: web::Path<String>,
     config: web::Data<RwLock<Config>>,
 ) -> Result<HttpResponse, Error> {
     let config = config
         .read()
-        .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
+        .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?
+        .clone();
+
+    if let Some(runtime) = request.app_data::<web::Data<AuthRuntime>>() {
+        let records = runtime
+            .store
+            .find_pastes_by_public_filename(&file)
+            .await
+            .map_err(error::ErrorInternalServerError)?;
+        let Some(record) = records
+            .into_iter()
+            .find(|record| record.storage_path.is_file())
+        else {
+            return Err(error::ErrorNotFound("file is not found or expired :(\n"));
+        };
+        if !can_delete_record(&auth, &record) {
+            return Err(error::ErrorForbidden(
+                "only the paste owner or an administrator may delete this file\n",
+            ));
+        }
+        if !record
+            .storage_path
+            .starts_with(path_clean::PathClean::clean(&config.server.upload_path))
+        {
+            return Err(error::ErrorInternalServerError(
+                "paste metadata points outside the upload directory",
+            ));
+        }
+        remove_paste_file(&record.storage_path, &file)?;
+        runtime
+            .store
+            .delete_paste(record.id)
+            .await
+            .map_err(error::ErrorInternalServerError)?;
+        return Ok(HttpResponse::Ok().body(String::from("file deleted\n")));
+    }
+
     let mut path = util::glob_match_file(safe_path_join(&config.server.upload_path, &*file)?)?;
     if !path.is_file() || !path.exists() {
         let protected_path = safe_path_join(
@@ -271,24 +364,35 @@ async fn delete(
         return Err(error::ErrorNotFound("file is not found or expired :(\n"));
     }
 
-    // Delete content file first, then password (prevents unprotected window)
-    match fs::remove_file(&path) {
+    remove_paste_file(&path, &file)?;
+    Ok(HttpResponse::Ok().body(String::from("file deleted\n")))
+}
+
+fn can_delete_record(auth: &RequestAuth, record: &PasteRecord) -> bool {
+    auth.global_delete || record.owner_principal_id == auth.principal_id()
+}
+
+fn remove_paste_file(path: &std::path::Path, public_filename: &str) -> Result<(), Error> {
+    // Delete content first, then its password sidecar to avoid an unprotected window.
+    match fs::remove_file(path) {
         Ok(_) => {
-            info!("deleted file: {:?}", file.to_string());
-            crate::password::delete_password_file(&path).ok();
+            info!("deleted file: {:?}", public_filename);
+            crate::password::delete_password_file(path).ok();
+            Ok(())
         }
-        Err(e) => {
-            error!("cannot delete file: {}", e);
-            return Err(error::ErrorInternalServerError("cannot delete file"));
+        Err(error_value) => {
+            error!("cannot delete file: {}", error_value);
+            Err(error::ErrorInternalServerError("cannot delete file"))
         }
     }
-    Ok(HttpResponse::Ok().body(String::from("file deleted\n")))
 }
 
 /// Expose version endpoint
 #[get("/version")]
-#[actix_web_grants::protect("TokenType::Auth", ty = TokenType, error = unauthorized_error)]
-async fn version(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> {
+async fn version(
+    _auth: RequestAuth,
+    config: web::Data<RwLock<Config>>,
+) -> Result<HttpResponse, Error> {
     let config = config
         .read()
         .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
@@ -303,13 +407,14 @@ async fn version(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Erro
 
 /// Handles file upload by processing `multipart/form-data`.
 #[post("/")]
-#[actix_web_grants::protect("TokenType::Auth", ty = TokenType, error = unauthorized_error)]
 async fn upload(
+    auth: RequestAuth,
     request: HttpRequest,
     mut payload: Multipart,
     client: web::Data<Client>,
     config: web::Data<RwLock<Config>>,
 ) -> Result<HttpResponse, Error> {
+    let auth_runtime = request.app_data::<web::Data<AuthRuntime>>().cloned();
     let connection = request.connection_info().clone();
     let host = connection.realip_remote_addr().unwrap_or("unknown host");
     let server_url = match config
@@ -368,21 +473,47 @@ async fn upload(
                     .unwrap_or(true)
             {
                 let bytes_checksum = util::sha256_digest(&*bytes)?;
-                let config = config
-                    .read()
-                    .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
-                if let Some(file) = Directory::try_from(config.server.upload_path.as_path())?
-                    .get_file(bytes_checksum)
-                {
-                    urls.push(format!(
-                        "{}/{}\n",
-                        server_url,
-                        file.path
-                            .file_name()
-                            .map(|v| v.to_string_lossy())
-                            .unwrap_or_default()
-                    ));
-                    continue;
+                if let Some(runtime) = &auth_runtime {
+                    let owner = auth
+                        .principal_id()
+                        .ok_or_else(|| error::ErrorUnauthorized("unauthorized\n"))?;
+                    if let Some(record) = runtime
+                        .store
+                        .find_owner_duplicate(owner, &bytes_checksum)
+                        .await
+                        .map_err(error::ErrorInternalServerError)?
+                    {
+                        if record.storage_path.is_file()
+                            && is_compatible_duplicate(paste_type, record.paste_type)
+                        {
+                            urls.push(format!("{}/{}\n", server_url, record.public_filename));
+                            continue;
+                        }
+                        if !record.storage_path.is_file() {
+                            runtime
+                                .store
+                                .delete_paste(record.id)
+                                .await
+                                .map_err(error::ErrorInternalServerError)?;
+                        }
+                    }
+                } else {
+                    let config = config
+                        .read()
+                        .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
+                    if let Some(file) = Directory::try_from(config.server.upload_path.as_path())?
+                        .get_file(bytes_checksum)
+                    {
+                        urls.push(format!(
+                            "{}/{}\n",
+                            server_url,
+                            file.path
+                                .file_name()
+                                .map(|v| v.to_string_lossy())
+                                .unwrap_or_default()
+                        ));
+                        continue;
+                    }
                 }
             }
             let mut paste = Paste {
@@ -410,9 +541,120 @@ async fn upload(
                     let config = config
                         .read()
                         .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?;
-                    paste.store_url(expiry_date, header_filename, &config)?
+                    paste
+                        .store_url(expiry_date, header_filename, &config)
+                        .map_err(|store_error| {
+                            if store_error.kind() == std::io::ErrorKind::AlreadyExists {
+                                error::ErrorConflict("file already exists\n")
+                            } else {
+                                store_error.into()
+                            }
+                        })?
                 }
             };
+
+            let stored_metadata = (|| -> Result<(String, u64), Error> {
+                if matches!(paste_type, PasteType::Url | PasteType::OneshotUrl) {
+                    let stored_data = fs::read(&result.storage_path)?;
+                    Ok((
+                        util::sha256_digest(&*stored_data)?,
+                        u64::try_from(stored_data.len()).map_err(|_| {
+                            error::ErrorInternalServerError("paste size is too large")
+                        })?,
+                    ))
+                } else {
+                    Ok((
+                        util::sha256_digest(&*paste.data)?,
+                        u64::try_from(paste.data.len()).map_err(|_| {
+                            error::ErrorInternalServerError("paste size is too large")
+                        })?,
+                    ))
+                }
+            })();
+            let (content_hash, stored_size_bytes) = match stored_metadata {
+                Ok(metadata) => metadata,
+                Err(metadata_error) => {
+                    remove_new_upload(&result.storage_path);
+                    return Err(metadata_error);
+                }
+            };
+            if paste_type == PasteType::RemoteFile
+                && expiry_date.is_none()
+                && !config
+                    .read()
+                    .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?
+                    .paste
+                    .duplicate_files
+                    .unwrap_or(true)
+            {
+                if let Some(runtime) = &auth_runtime {
+                    let owner = auth
+                        .principal_id()
+                        .ok_or_else(|| error::ErrorUnauthorized("unauthorized\n"))?;
+                    if let Some(record) = runtime
+                        .store
+                        .find_owner_duplicate(owner, &content_hash)
+                        .await
+                        .map_err(error::ErrorInternalServerError)?
+                    {
+                        if record.storage_path.is_file()
+                            && is_compatible_duplicate(paste_type, record.paste_type)
+                        {
+                            remove_new_upload(&result.storage_path);
+                            urls.push(format!("{}/{}\n", server_url, record.public_filename));
+                            continue;
+                        }
+                        if !record.storage_path.is_file() {
+                            runtime
+                                .store
+                                .delete_paste(record.id)
+                                .await
+                                .map_err(error::ErrorInternalServerError)?;
+                        }
+                    }
+                }
+            }
+
+            if let Some(runtime) = &auth_runtime {
+                let owner = auth
+                    .principal_id()
+                    .ok_or_else(|| error::ErrorUnauthorized("unauthorized\n"))?;
+                let deduplicate = expiry_date.is_none()
+                    && matches!(
+                        paste_type,
+                        PasteType::File | PasteType::RemoteFile | PasteType::Url
+                    )
+                    && !config
+                        .read()
+                        .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?
+                        .paste
+                        .duplicate_files
+                        .unwrap_or(true);
+                let new_paste = NewPaste {
+                    owner_principal_id: Some(owner),
+                    public_filename: result.filename.clone(),
+                    storage_path: result.storage_path.clone(),
+                    paste_type,
+                    created_at: i64::try_from(time.as_secs()).map_err(|_| {
+                        error::ErrorInternalServerError("paste creation time is too large")
+                    })?,
+                    size_bytes: stored_size_bytes,
+                    expires_at: expiry_seconds(expiry_date)?,
+                    content_hash,
+                };
+                match persist_paste_metadata(runtime, &new_paste, deduplicate).await {
+                    Ok(Some(existing)) => {
+                        remove_new_upload(&result.storage_path);
+                        urls.push(format!("{}/{}\n", server_url, existing.public_filename));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(store_error) => {
+                        remove_new_upload(&result.storage_path);
+                        return Err(store_error);
+                    }
+                }
+            }
 
             let mut file_name = result.filename;
             let password = result.password;
@@ -444,6 +686,90 @@ async fn upload(
     Ok(HttpResponse::Ok().body(urls.join("")))
 }
 
+async fn persist_paste_metadata(
+    runtime: &AuthRuntime,
+    paste: &NewPaste,
+    deduplicate: bool,
+) -> Result<Option<PasteRecord>, Error> {
+    if !deduplicate {
+        runtime
+            .store
+            .insert_paste(paste)
+            .await
+            .map_err(map_paste_store_error)?;
+        return Ok(None);
+    }
+
+    // A stale metadata row may win the unique-key race after the optimistic
+    // filesystem check. Remove it and retry without discarding this upload.
+    for _ in 0..3 {
+        match runtime.store.insert_paste_deduplicated(paste).await {
+            Ok(PasteInsert::Inserted(_)) => return Ok(None),
+            Ok(PasteInsert::Duplicate(existing)) if existing.storage_path.is_file() => {
+                return Ok(Some(existing));
+            }
+            Ok(PasteInsert::Duplicate(existing)) => {
+                runtime
+                    .store
+                    .delete_paste(existing.id)
+                    .await
+                    .map_err(error::ErrorInternalServerError)?;
+            }
+            Err(store_error) => {
+                return Err(map_paste_store_error(store_error));
+            }
+        }
+    }
+
+    Err(error::ErrorInternalServerError(
+        "cannot persist paste ownership after removing stale duplicate metadata",
+    ))
+}
+
+fn map_paste_store_error(store_error: StoreError) -> Error {
+    match store_error {
+        StoreError::PublicFilenameConflict(_) => error::ErrorConflict("file already exists\n"),
+        other => {
+            error::ErrorInternalServerError(format!("cannot persist paste ownership: {other}"))
+        }
+    }
+}
+
+fn expiry_seconds(expiry_millis: Option<u128>) -> Result<Option<i64>, Error> {
+    expiry_millis
+        .map(|value| {
+            value
+                .checked_add(999)
+                .ok_or_else(|| error::ErrorInternalServerError("paste expiry is too large"))
+                .and_then(|value| {
+                    i64::try_from(value / 1000)
+                        .map_err(|_| error::ErrorInternalServerError("paste expiry is too large"))
+                })
+        })
+        .transpose()
+}
+
+fn is_compatible_duplicate(requested: PasteType, existing: PasteType) -> bool {
+    matches!(
+        (requested, existing),
+        (
+            PasteType::File | PasteType::RemoteFile,
+            PasteType::File | PasteType::RemoteFile
+        ) | (PasteType::Url, PasteType::Url)
+    )
+}
+
+fn remove_new_upload(path: &std::path::Path) {
+    if let Err(error_value) = fs::remove_file(path) {
+        error!(
+            "cannot roll back uploaded file {}: {}",
+            path.display(),
+            error_value
+        );
+    }
+    crate::password::delete_password_file(path).ok();
+}
+
 /// File entry item for list endpoint.
 #[derive(Serialize, Deserialize)]
 pub struct ListItem {
@@ -459,10 +785,19 @@ pub struct ListItem {
     pub expires_at_utc: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ListOptions {
+    scope: Option<String>,
+}
+
 /// Returns the list of files.
 #[get("/list")]
-#[actix_web_grants::protect("TokenType::Auth", ty = TokenType, error = unauthorized_error)]
-async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> {
+async fn list(
+    auth: RequestAuth,
+    request: HttpRequest,
+    options: web::Query<ListOptions>,
+    config: web::Data<RwLock<Config>>,
+) -> Result<HttpResponse, Error> {
     let config = config
         .read()
         .map_err(|_| error::ErrorInternalServerError("cannot acquire config"))?
@@ -470,6 +805,34 @@ async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> 
     if !config.server.expose_list.unwrap_or(false) {
         warn!("server is not configured to expose list endpoint");
         Err(error::ErrorNotFound(""))?;
+    }
+
+    if let Some(runtime) = request.app_data::<web::Data<AuthRuntime>>() {
+        let records = match options.scope.as_deref() {
+            None | Some("own") => {
+                runtime
+                    .store
+                    .list_owner_pastes(
+                        auth.principal_id()
+                            .ok_or_else(|| error::ErrorUnauthorized("unauthorized\n"))?,
+                    )
+                    .await
+            }
+            Some("all") if auth.is_admin() => runtime.store.list_all_pastes().await,
+            Some("all") => {
+                return Err(error::ErrorForbidden(
+                    "administrator access is required for scope=all\n",
+                ));
+            }
+            Some(_) => return Err(error::ErrorBadRequest("scope must be own or all\n")),
+        }
+        .map_err(error::ErrorInternalServerError)?;
+        let entries = records
+            .into_iter()
+            .filter(|record| record.storage_path.is_file())
+            .map(list_item_from_record)
+            .collect::<Vec<_>>();
+        return Ok(HttpResponse::Ok().json(entries));
     }
 
     let get_item_list = |item_type: PasteType| -> Result<Vec<ListItem>, Error> {
@@ -550,6 +913,28 @@ async fn list(config: web::Data<RwLock<Config>>) -> Result<HttpResponse, Error> 
     Ok(HttpResponse::Ok().json(entries))
 }
 
+fn list_item_from_record(record: PasteRecord) -> ListItem {
+    ListItem {
+        file_name: PathBuf::from(record.public_filename),
+        file_size: match record.paste_type {
+            PasteType::File
+            | PasteType::RemoteFile
+            | PasteType::Oneshot
+            | PasteType::ProtectedFile => Some(record.size_bytes),
+            PasteType::Url | PasteType::OneshotUrl => None,
+        },
+        item_type: record.paste_type,
+        creation_date_utc: Some(uts2ts::uts2ts(record.created_at).as_string()),
+        expires_at_utc: record
+            .expires_at
+            .map(|expires_at| uts2ts::uts2ts(expires_at).as_string()),
+    }
+}
+
+async fn method_not_allowed(_auth: RequestAuth) -> HttpResponse {
+    HttpResponse::MethodNotAllowed().finish()
+}
+
 /// Configures the server routes.
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -560,11 +945,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .service(serve)
             .service(upload)
             .service(delete)
-            .route("", web::head().to(HttpResponse::MethodNotAllowed))
-            .wrap(GrantsMiddleware::with_extractor(extract_tokens))
-            .wrap(
-                ErrorHandlers::new().handler(StatusCode::UNAUTHORIZED, handle_unauthorized_error),
-            ),
+            .route("", web::head().to(method_not_allowed))
+            .wrap(SessionCookieRefresh),
     );
 }
 
@@ -586,6 +968,61 @@ mod tests {
     use glob::glob;
     use std::fs::File;
     use std::io::Write;
+
+    fn request_auth(source: CredentialSource) -> RequestAuth {
+        RequestAuth {
+            principal: None,
+            credential_id: None,
+            expires_at: None,
+            global_delete: false,
+            source,
+        }
+    }
+
+    #[test]
+    fn protected_password_uses_separate_header_for_api_tokens() {
+        let api_auth = request_auth(CredentialSource::Api {
+            secret: String::from("api-token"),
+        });
+        let request = TestRequest::get()
+            .insert_header((AUTHORIZATION, "Bearer api-token"))
+            .to_http_request();
+        assert_eq!(None, extract_protected_password(&request, &api_auth));
+
+        let request = TestRequest::get()
+            .insert_header((AUTHORIZATION, "Bearer api-token"))
+            .insert_header(("X-Rustypaste-Password", "paste-password"))
+            .to_http_request();
+        assert_eq!(
+            Some(String::from("paste-password")),
+            extract_protected_password(&request, &api_auth)
+        );
+
+        let browser_auth = request_auth(CredentialSource::Browser {
+            secret: String::from("session"),
+        });
+        let request = TestRequest::get()
+            .insert_header((AUTHORIZATION, "Bearer paste-password"))
+            .to_http_request();
+        assert_eq!(
+            Some(String::from("paste-password")),
+            extract_protected_password(&request, &browser_auth)
+        );
+    }
+
+    #[test]
+    fn duplicate_types_preserve_paste_semantics() {
+        assert!(is_compatible_duplicate(
+            PasteType::RemoteFile,
+            PasteType::File
+        ));
+        assert!(is_compatible_duplicate(PasteType::Url, PasteType::Url));
+        assert!(!is_compatible_duplicate(
+            PasteType::File,
+            PasteType::ProtectedFile
+        ));
+        assert!(!is_compatible_duplicate(PasteType::Url, PasteType::File));
+    }
     use std::path::PathBuf;
     use std::str;
     use std::str::FromStr;

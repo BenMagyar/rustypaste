@@ -20,6 +20,34 @@ expose_list = false
 #]
 handle_spaces = "replace" # or "encode"
 
+# Enable OIDC authentication, persistent browser/CLI credentials, and paste
+# ownership by uncommenting this section. The SQLite database should be stored
+# outside upload_path and persisted across restarts.
+#[auth]
+#database_path = "./state/auth.sqlite3"
+#session_idle_timeout = "90d"
+#token_idle_timeout = "90d"
+#secure_cookies = true
+#allow_insecure_http = false # local development only
+
+#[auth.oidc]
+#issuer_url = "https://identity.example.com"
+#client_id = "rustypaste"
+#client_secret = "replace-me" # or set AUTH__OIDC__CLIENT_SECRET
+#scopes = ["openid", "profile", "email", "groups"]
+
+# Claim keys use AND semantics. A string or any value in an array may match.
+#[auth.authorization.required_claims]
+#groups = ["paste-users", "paste-admins"]
+
+#[auth.authorization.admin_claims]
+#groups = "paste-admins"
+
+# Named service accounts use exactly one of token, token_file, or token_env.
+#[auth.service_accounts.ci]
+#token_env = "RUSTYPASTE_CI_TOKEN"
+#admin = false
+
 [landing_page]
 text = """
 ┬─┐┬ ┬┌─┐┌┬┐┬ ┬┌─┐┌─┐┌─┐┌┬┐┌─┐

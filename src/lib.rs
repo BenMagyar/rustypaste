@@ -16,6 +16,18 @@ pub mod header;
 /// Auth handler.
 pub mod auth;
 
+/// Browser and CLI authentication HTTP routes.
+pub mod auth_server;
+
+/// OpenID Connect discovery and authorization-code flow.
+pub mod oidc;
+
+/// SQLite authentication and paste ownership persistence.
+pub mod store;
+
+/// Paste ownership filesystem reconciliation.
+pub mod ownership;
+
 /// Storage handler.
 pub mod paste;
 

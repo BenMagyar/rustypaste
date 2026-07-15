@@ -10,7 +10,14 @@ homepage = "https://github.com/orhun/rustypaste"
 repository = "https://github.com/orhun/rustypaste"
 keywords = ["paste", "pastebin", "upload"]
 categories = ["web-programming::http-server"]
-include = ["src/**/*", "Cargo.*", "LICENSE", "README.md", "CHANGELOG.md"]
+include = [
+  "src/**/*",
+  "migrations/**/*",
+  "Cargo.*",
+  "LICENSE",
+  "README.md",
+  "CHANGELOG.md",
+]
 
 [features]
 default = ["rustls"]
@@ -19,11 +26,11 @@ rustls = ["actix-web/rustls-0_23", "awc/rustls-0_23-webpki-roots"]
 
 [dependencies]
 actix-web = { version = "4.13.0" }
-actix-web-grants = { version = "4.1.2" }
 actix-multipart = "0.8.0"
 actix-files = "0.6.10"
 awc = { version = "3.8.2" }
 serde = "1.0.228"
+serde_json = "1.0.149"
 futures-util = "0.3.32"
 argon2 = { version = "0.5", features = ["std"] } 
 base64 = "0.22"
@@ -42,6 +49,7 @@ humantime = "2.3.0"
 humantime-serde = "1.1.1"
 glob = "0.3.3"
 ring = "0.17.14"
+subtle = "2.6.1"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
 hotwatch = "0.5.0"
 tokio = { version = "1.52.3", optional = true }
@@ -50,6 +58,14 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uts2ts = "1.0.0"
 path-clean = "1.0.1"
 mime_guess = "2.0.5"
+openidconnect = { version = "4.0.1", default-features = false, features = [
+  "reqwest",
+  "rustls-tls",
+] }
+sqlx = { version = "0.8.6", default-features = false, features = [
+  "runtime-tokio-rustls",
+  "sqlite",
+] }
 
 [dependencies.config]
 version = "0.15.23"
@@ -66,6 +82,7 @@ default-features = false
 
 [dev-dependencies]
 actix-rt = "2.11.0"
+tempfile = "3.27.0"
 
 [profile.dev]
 opt-level = 0

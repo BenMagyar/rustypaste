@@ -138,11 +138,12 @@ pub fn get_orphaned_password_files(base_path: &Path) -> Vec<PathBuf> {
         .filter_map(|dir| glob(&dir.join("*.password").to_string_lossy()).ok())
         .flat_map(|g| g.filter_map(|v| v.ok()))
         .filter(|password_path| {
-            password_path
-                .file_stem()
-                .and_then(|stem| password_path.parent().map(|p| p.join(stem)))
-                .map(|main_path| !main_path.exists())
-                .unwrap_or(false)
+            crate::password::is_password_hash_file(password_path)
+                && password_path
+                    .file_stem()
+                    .and_then(|stem| password_path.parent().map(|p| p.join(stem)))
+                    .map(|main_path| !main_path.exists())
+                    .unwrap_or(false)
         })
         .collect()
 }
@@ -404,17 +405,21 @@ mod tests {
 
         // Create orphaned password file in root
         let orphan_root = test_dir.join("orphan_root.txt.password");
-        fs::write(&orphan_root, "hash")?;
+        fs::write(&orphan_root, crate::password::hash_password("orphan")?)?;
 
         // Create orphaned password file in protected/
         let orphan_protected = protected_dir.join("orphan_protected.txt.password");
-        fs::write(&orphan_protected, "hash")?;
+        fs::write(&orphan_protected, crate::password::hash_password("orphan")?)?;
 
         // Create non-orphaned password file (has main file)
         let main_file = protected_dir.join("valid.txt");
         let valid_password = protected_dir.join("valid.txt.password");
         fs::write(&main_file, "content")?;
-        fs::write(&valid_password, "hash")?;
+        fs::write(&valid_password, crate::password::hash_password("valid")?)?;
+
+        // A regular upload ending in .password must not be deleted as an orphan.
+        let legitimate_upload = test_dir.join("notes.password");
+        fs::write(&legitimate_upload, "regular paste content")?;
 
         let orphans = get_orphaned_password_files(&test_dir);
 
@@ -423,6 +428,7 @@ mod tests {
         assert!(orphans.contains(&orphan_root));
         assert!(orphans.contains(&orphan_protected));
         assert!(!orphans.contains(&valid_password));
+        assert!(!orphans.contains(&legitimate_upload));
 
         fs::remove_dir_all(&test_dir)?;
         Ok(())

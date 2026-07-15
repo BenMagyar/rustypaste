@@ -92,8 +92,8 @@ some text
 - Easy to deploy
   - [docker images](https://hub.docker.com/r/orhunp/rustypaste)
   - [appjail images](https://github.com/AppJail-makejails/rustypaste)
-- No database
-  - filesystem is used
+- Filesystem-backed paste storage
+  - optional SQLite database for OIDC sessions and ownership metadata
 - Self-hosted
   - _centralization is bad!_
 - Written in Rust
@@ -242,6 +242,19 @@ Download with Bearer token:
 $ curl -H "Authorization: Bearer aBcD1234EfGh5678IjKl9012" https://paste.site.com/secret.txt
 ```
 
+When OIDC is enabled, API requests use the `Authorization` header for the global
+API credential. Pass the paste password separately:
+
+```sh
+$ curl \
+  -H "Authorization: Bearer <api_token>" \
+  -H "X-Rustypaste-Password: aBcD1234EfGh5678IjKl9012" \
+  https://paste.site.com/secret.txt
+```
+
+A browser session can continue to use the existing Basic or Bearer password
+forms because the session cookie supplies global authentication.
+
 Or with Basic Auth:
 
 ```sh
@@ -279,13 +292,16 @@ done
 
 #### Delete file from server
 
-Set `delete_tokens` array in [config.toml](./config.toml) to activate the [`DELETE`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods/DELETE) endpoint and secure it with one (or more) auth token(s).
+With legacy authentication, set the `delete_tokens` array in [config.toml](./config.toml) to activate the [`DELETE`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods/DELETE) endpoint and secure it with one (or more) auth token(s).
 
 ```sh
 $ curl -H "Authorization: <auth_token>" -X DELETE "<server_address>/file.txt"
 ```
 
-> The `DELETE` endpoint will not be exposed and will return `404` error if `delete_tokens` are not set.
+> Without `[auth]`, the `DELETE` endpoint will not be exposed and will return a
+> `404` error if `delete_tokens` are not set. With OIDC enabled, owners can
+> delete their own pastes and administrators can delete any paste without a
+> legacy delete token.
 
 #### Override the filename
 
@@ -314,6 +330,93 @@ $ CONFIG="$HOME/.rustypaste.toml" rustypaste
 
 #### Authentication
 
+##### OIDC
+
+Configure `[auth]` to protect paste uploads, downloads, the landing page, the
+list, version, and delete endpoints with a generic OpenID Connect provider. The
+provider must allow this redirect URI, based on `[server].url`:
+
+```text
+https://paste.example.com/auth/callback
+```
+
+Browser requests without a session are redirected to the login flow. API
+requests must authenticate with a CLI credential, service-account bearer token,
+or compatible legacy token.
+
+A minimal configuration is:
+
+```toml
+[server]
+url = "https://paste.example.com"
+
+[auth]
+database_path = "./state/auth.sqlite3"
+session_idle_timeout = "90d"
+token_idle_timeout = "90d"
+secure_cookies = true
+
+[auth.oidc]
+issuer_url = "https://identity.example.com"
+client_id = "rustypaste"
+client_secret = "replace-me"
+scopes = ["openid", "profile", "email", "groups"]
+
+[auth.authorization.required_claims]
+groups = ["paste-users", "paste-admins"]
+
+[auth.authorization.admin_claims]
+groups = "paste-admins"
+```
+
+Secrets may also be supplied through config environment overrides, such as
+`AUTH__OIDC__CLIENT_SECRET`, instead of being written to the TOML file.
+
+Claim rules inspect top-level string claims or arrays of strings. All configured
+claim keys must match, while an array in the configuration accepts any listed
+value. Empty `required_claims` allows every identity accepted by the provider;
+empty `admin_claims` grants no administrator access.
+
+Browser sessions and CLI credentials use rolling 90-day idle timeouts by
+default. Configure them independently with `session_idle_timeout` and
+`token_idle_timeout`. Keep `secure_cookies = true` in production. Plain HTTP is
+rejected unless `allow_insecure_http = true`, which is intended only for local
+development. Each principal can have up to 32 active browser sessions and 32
+dynamically issued CLI credentials; newer logins replace the oldest entries.
+
+The SQLite database contains authentication and ownership metadata, not paste
+contents. Keep `database_path` outside `[server].upload_path`, persist it across
+restarts, and back it up with the upload directory.
+
+Authentication settings are initialized at startup. Restart rustypaste after
+changing `[auth]`, OIDC claim rules, service accounts, or legacy token settings.
+
+Named service accounts provide bearer authentication for automation:
+
+```toml
+[auth.service_accounts.ci]
+token_env = "RUSTYPASTE_CI_TOKEN"
+admin = false
+```
+
+Each account must configure exactly one of `token`, `token_file`, or `token_env`.
+Set `admin = true` only for automation that needs global listing and deletion.
+
+The standalone [`rpaste`](https://github.com/orhun/rustypaste-cli) client uses a
+browser-assisted device login:
+
+```sh
+$ rpaste -s "https://paste.example.com" auth login
+$ rpaste -s "https://paste.example.com" auth status
+$ rpaste -s "https://paste.example.com" auth logout
+```
+
+The login command displays a verification code, opens the verification page,
+and stores a credential for that server. `status` verifies the current identity;
+`logout` revokes and removes that credential.
+
+##### Legacy tokens
+
 To enable basic HTTP auth, set the `AUTH_TOKEN` environment variable (via `.env`):
 
 ```sh
@@ -326,7 +429,14 @@ There are 2 options for setting multiple auth tokens:
 - Via the array field `[server].auth_tokens` in your `config.toml`.
 - Or by writing a newline separated list to a file and passing its path to rustypaste via `AUTH_TOKENS_FILE` and `DELETE_TOKENS_FILE` respectively.
 
-> If neither `AUTH_TOKEN`, `AUTH_TOKENS_FILE` nor `[server].auth_tokens` are set, the server will not require any authentication.
+These static token settings remain compatible but are deprecated when `[auth]`
+is enabled. Existing authentication tokens become a shared legacy principal;
+existing delete tokens retain global deletion access without gaining other
+administrator privileges. Prefer named
+service accounts for new automation.
+
+> When `[auth]` is not configured, the server will not require authentication if
+> neither `AUTH_TOKEN`, `AUTH_TOKENS_FILE` nor `[server].auth_tokens` are set.
 >
 > Exception is the `DELETE` endpoint, which requires at least one token to be set. See [deleting files from server](#delete-file-from-server) for more information.
 
@@ -343,15 +453,30 @@ text-like types as `text/plain; charset=utf-8` to avoid script execution.
 
 #### List endpoint
 
-Set `expose_list` to true in [config.toml](./config.toml) to be able to retrieve a JSON formatted list of files in your uploads directory. This will not include oneshot files, oneshot URLs, or URLs.
+Set `expose_list` to true in [config.toml](./config.toml) to retrieve a JSON
+formatted list of pastes.
 
 ```sh
 $ curl "http://<server_address>/list"
 
-[{"file_name":"accepted-cicada.txt","file_size":241,"expires_at_utc":null}]
+[{"file_name":"accepted-cicada.txt","file_size":241,"item_type":"file","creation_date_utc":"2026-07-14 22:15:00","expires_at_utc":null}]
 ```
 
 This route will require an `AUTH_TOKEN` if one is set.
+
+With OIDC enabled, `/list` returns only pastes owned by the authenticated
+principal. Administrators can request the global view with:
+
+```sh
+$ curl -H "Authorization: Bearer <api_token>" \
+  "https://paste.example.com/list?scope=all"
+```
+
+An exact paste link is shareable with any authenticated user; listing does not
+grant or restrict link access. Paste owners can delete their own pastes, while
+administrators can delete any paste. Files that already existed before OIDC was
+enabled are reconciled as unowned: they remain available by exact link and only
+administrators can discover them through the global list or delete them.
 
 #### HTML Form
 
@@ -369,6 +494,7 @@ Following command can be used to run a container which is built from the [Docker
 ```sh
 $ docker run --rm -d \
   -v "$(pwd)/upload/":/app/upload \
+  -v "$(pwd)/state/":/app/state \
   -v "$(pwd)/config.toml":/app/config.toml \
   --env-file "$(pwd)/.env" \
   -e "RUST_LOG=debug" \
@@ -378,7 +504,10 @@ $ docker run --rm -d \
 ```
 
 - uploaded files go into `./upload` (on the host machine)
-- set the `AUTH_TOKEN` via `-e` or `--env-file` to enable auth
+- OIDC state goes into `./state` when `[auth].database_path` is
+  `/app/state/auth.sqlite3` (or `./state/auth.sqlite3` from the container workdir)
+- set `AUTH_TOKEN` via `-e` or `--env-file` to enable legacy authentication, or
+  configure `[auth]` for OIDC
 
 You can build this image using `docker build -t rustypaste .` command.
 

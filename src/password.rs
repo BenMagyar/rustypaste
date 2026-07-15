@@ -9,8 +9,8 @@ use argon2::{
     Argon2, ParamsBuilder,
 };
 use rand::distr::{Alphanumeric, SampleString};
-use std::fs;
-use std::io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult};
+use std::fs::{self, OpenOptions};
+use std::io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult, Write};
 use std::path::{Path, PathBuf};
 
 /// Generate random alphanumeric password (24 chars = ~143 bits entropy)
@@ -69,13 +69,24 @@ pub fn get_password_file_path(file_path: &Path) -> IoResult<PathBuf> {
 pub fn store_password_hash(file_path: &Path, password: &str) -> IoResult<()> {
     let hash = hash_password(password)?;
     let password_path = get_password_file_path(file_path)?;
-    fs::write(password_path, hash)
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(password_path)?;
+    file.write_all(hash.as_bytes())
 }
 
 /// Check if file has password protection
 pub fn has_password(file_path: &Path) -> bool {
     get_password_file_path(file_path)
         .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Returns whether a file contains a syntactically valid password sidecar hash.
+pub fn is_password_hash_file(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|hash| PasswordHash::new(hash.trim()).is_ok())
         .unwrap_or(false)
 }
 
